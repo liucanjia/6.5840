@@ -141,9 +141,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
-	XTerm   int
-	XLog    int
-	XLen    int
+	XTerm   int //term in the conflicting entry (if any), 0 mean entry is empty
+	XIndex  int //index of first entry with that term (if any)
+	XLen    int //log length
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -622,7 +622,7 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 			} else {
 				Debug(dLog, "S%d logEntries are not matching with S%d, decrement nextIndex and retry.", rf.me, server)
 				if rf.nextIndex[server] > 1 {
-					rf.nextIndex[server]--
+					rf.updateNextIndex(reply.XTerm, reply.XIndex, reply.XLen, server)
 
 					lastLogIndex, _ := rf.logs.getLastInfo()
 					newArgs := &AppendEntriesArgs{}
@@ -632,6 +632,29 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 			}
 		}
 	}
+}
+
+func (rf *Raft) updateNextIndex(xTerm, xIndex, xLen, server int) {
+	if xTerm == 0 {
+		rf.nextIndex[server] = xLen
+		return
+	}
+
+	flag := false
+	idx := len(rf.logs)
+	for ; idx > rf.matchIndex[server]; idx-- {
+		if rf.logs.getEntry(idx).Term == xTerm {
+			flag = true
+			break
+		}
+	}
+
+	if !flag {
+		rf.nextIndex[server] = xIndex
+	} else {
+		rf.nextIndex[server] = idx
+	}
+
 }
 
 func (rf *Raft) updateCommitIndex() {
@@ -690,6 +713,17 @@ func (rf *Raft) matchLog(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if entry.Term != args.PrevLogTerm {
 		Debug(dLog2, "S%d prev logEntry do not match at index %d.", rf.me, args.PrevLogIndex)
 		reply.Success = false
+		reply.XTerm = entry.Term
+		if reply.XTerm == 0 {
+			// log too short, entry is nil
+			reply.XLen = len(rf.logs)
+		} else {
+			idx := args.PrevLogIndex
+			for idx >= 0 && rf.logs.getEntry(idx).Term == reply.XTerm {
+				idx--
+			}
+			reply.XIndex = idx + 1
+		}
 	} else {
 		for i, leaderEntry := range args.Entries {
 			followerEntryIndex := args.PrevLogIndex + i + 1
