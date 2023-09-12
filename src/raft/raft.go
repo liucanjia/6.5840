@@ -150,8 +150,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Debug(dLog2, "S%d recevied appendEntries from S%d at Term T%d.", rf.me, args.LeaderId, rf.currentTerm)
-
 	if args.Term < rf.currentTerm {
 		Debug(dLog2, "S%d Term is T%d, higher than S%d Term T%d, rejecting append request.", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 		reply.Term = rf.currentTerm
@@ -603,7 +601,7 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 		Debug(dLog, "S%d received appendEntry reply from S%d at Term T%d.", rf.me, server, rf.currentTerm)
 
 		if reply.Term < rf.currentTerm {
-			Debug(dLog, "S%d Term is lower than S%d")
+			Debug(dLog, "S%d Term is lower than S%d", server, rf.me)
 			return
 		} else if reply.Term > rf.currentTerm {
 			Debug(dLog, "S%d received a higher Term appendEntry reply from S%d at Term T%d, switching to follower.", rf.me, server, reply.Term)
@@ -648,8 +646,11 @@ func (rf *Raft) updateCommitIndex() {
 		}
 
 		if cnt > len(rf.peers)/2 {
-			rf.commitIndex = N
-			Debug(dCommit, "S%d update commitIndex to %d at Term T%d.", rf.me, rf.commitIndex, rf.currentTerm)
+			// only log entries from the leader's currrent term are allowed to be committed
+			if rf.logs.getEntry(N).Term == rf.currentTerm {
+				rf.commitIndex = N
+				Debug(dCommit, "S%d update commitIndex to %d at Term T%d.", rf.me, rf.commitIndex, rf.currentTerm)
+			}
 			break
 		}
 	}
