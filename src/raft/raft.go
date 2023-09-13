@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"os"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -195,6 +197,7 @@ func (rf *Raft) swicthToFollower(term int, votedFor int) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = votedFor
+	rf.persist()
 	rf.setHeartbeatTimeout(randTimeout(BaseHeartbeatTimeout))
 }
 
@@ -232,6 +235,26 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	Debug(dPersist, "S%d saving previously persisted state to persister.", rf.me)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		Debug(dError, "S%d failed to decode currentTerm.", rf.me)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		Debug(dError, "S%d failed to decode votedFor.", rf.me)
+	}
+	err = e.Encode(rf.logs)
+	if err != nil {
+		Debug(dError, "S%d failed to decode logs.", rf.me)
+	}
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -252,6 +275,28 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	Debug(dPersist, "S%d restoring previously persisted state from persister.", rf.me)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	err := d.Decode(&rf.currentTerm)
+	if err != nil {
+		Debug(dError, "S%d can not read currentTerm from persister.", rf.me)
+	}
+
+	err = d.Decode(&rf.votedFor)
+	if err != nil {
+		Debug(dError, "S%d can not read votedFor from persister.", rf.me)
+	}
+
+	err = d.Decode(&rf.logs)
+	if err != nil {
+		Debug(dError, "S%d can not read logs from persister.", rf.me)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -295,6 +340,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		Debug(dVote, "S%d Term is T%d, lower than Term T%d, switching to follower and update the Term.", rf.me, rf.currentTerm, args.Term)
+		rf.swicthToFollower(args.Term, -1)
+	}
+
+	reply.Term = rf.currentTerm
+
 	flag := false
 	lastLogIndex, lastLogTerm := rf.logs.getLastInfo()
 	if args.LastLogTerm > lastLogTerm {
@@ -304,31 +356,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if !flag {
-		reply.Term = args.Term
 		reply.VotedGranted = false
 		return
 	}
 
-	if args.Term == rf.currentTerm {
-		// if not vote for other, vote for candidate
-		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-			Debug(dVote, "S%d granting vote to S%d at Term T%d.", rf.me, args.CandidateId, args.Term)
-			rf.swicthToFollower(args.Term, args.CandidateId)
-
-			reply.Term = args.Term
-			reply.VotedGranted = true
-		} else {
-			Debug(dVote, "S%d has vote to S%d, rejecting vote to S%d at Term T%d.", rf.me, rf.votedFor, args.CandidateId, args.Term)
-			reply.Term = args.Term
-			reply.VotedGranted = false
-		}
-	} else {
-		// vote for candidate
+	// if not vote for other, vote for candidate
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		Debug(dVote, "S%d granting vote to S%d at Term T%d.", rf.me, args.CandidateId, args.Term)
 		rf.swicthToFollower(args.Term, args.CandidateId)
-
-		reply.Term = args.Term
 		reply.VotedGranted = true
+	} else {
+		Debug(dVote, "S%d has vote to S%d, rejecting vote to S%d at Term T%d.", rf.me, rf.votedFor, args.CandidateId, args.Term)
+		reply.VotedGranted = false
 	}
 }
 
@@ -401,6 +440,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.logs = append(rf.logs, log)
+	rf.persist()
 	index, term = len(rf.logs), rf.currentTerm
 	Debug(dLog, "S%d Add command at Term T%d, Command: %v.", rf.me, rf.currentTerm, command)
 	rf.sendEntries(false)
@@ -464,16 +504,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.swicthToFollower(0, -1)
+	rf.state = Follower
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.logs = make([]LogEntry, 0)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.setHeartbeatTimeout(randTimeout(BaseHeartbeatTimeout))
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
@@ -487,9 +527,10 @@ func (rf *Raft) beginElection() {
 	rf.state = Candidate
 
 	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.persist()
 	Debug(dTerm, "S%d starting a new term. Now at Term T%d.", rf.me, rf.currentTerm)
 
-	rf.votedFor = rf.me
 	rf.setElectionTimeout(randTimeout(BaseElectionTimeout))
 	Debug(dTimer, "S%d resetting the electionTimeout, because starting a new election.", rf.me)
 
@@ -549,7 +590,7 @@ func (rf *Raft) candidateRequestVote(voteCnt *int, agrs *RequestVoteArgs, once *
 				})
 			}
 		} else {
-			Debug(dError, "S%d get a error reply at Term T%d from S%d. Reply.Term is %d, reply.VotedGranted is %t.", rf.me, rf.currentTerm, reply.Term, reply.VotedGranted)
+			Debug(dError, "S%d get a error reply at Term T%d from S%d. Reply.Term is %d, reply.VotedGranted is %t.", rf.me, rf.currentTerm, server, reply.Term, reply.VotedGranted)
 		}
 	}
 }
@@ -620,8 +661,8 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 				rf.matchIndex[server] = max(newMatchIndex, rf.matchIndex[server])
 				rf.updateCommitIndex()
 			} else {
-				Debug(dLog, "S%d logEntries are not matching with S%d, decrement nextIndex and retry.", rf.me, server)
 				if rf.nextIndex[server] > 1 {
+					Debug(dLog, "S%d logEntries are not matching with S%d, decrement nextIndex and retry.", rf.me, server)
 					rf.updateNextIndex(reply.XTerm, reply.XIndex, reply.XLen, server)
 
 					lastLogIndex, _ := rf.logs.getLastInfo()
@@ -636,13 +677,14 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 
 func (rf *Raft) updateNextIndex(xTerm, xIndex, xLen, server int) {
 	if xTerm == 0 {
-		rf.nextIndex[server] = xLen
+		rf.nextIndex[server] = max(xLen, 1)
 		return
 	}
 
 	flag := false
-	idx := len(rf.logs)
-	for ; idx > rf.matchIndex[server]; idx-- {
+	idx := rf.nextIndex[server]
+	// nextIndex at least must be 1
+	for ; idx > 1 && idx > rf.matchIndex[server]; idx-- {
 		if rf.logs.getEntry(idx).Term == xTerm {
 			flag = true
 			break
@@ -730,13 +772,15 @@ func (rf *Raft) matchLog(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 			entry = rf.logs.getEntry(followerEntryIndex)
 			if leaderEntry.Term != entry.Term {
 				rf.logs = append(rf.logs.getLogsSlice(1, followerEntryIndex), args.Entries[i:]...)
+				rf.persist()
+				Debug(dLog2, "S%d append logEntries success, now logs len is %d.", rf.me, len(rf.logs))
 				break
 			}
 		}
-		Debug(dLog2, "S%d append logEntries success, now logs len is %d.", rf.me, len(rf.logs))
 
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+			Debug(dLog2, "S%d update CommitIndex to %d at Term T%d as a follower.", rf.me, rf.commitIndex, rf.currentTerm)
 		}
 		reply.Success = true
 	}
