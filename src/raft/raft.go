@@ -176,11 +176,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else if args.Term > rf.currentTerm {
 		Debug(dLog2, "S%d received higher Term T%d appendEntries from S%d, converting to follower.", rf.me, args.Term, args.LeaderId)
-		rf.swicthToFollower(args.Term, -1)
+		rf.swicthToFollower(args.Term, -1, true)
 	} else if args.Term == rf.currentTerm {
 		if rf.state == Candidate {
 			Debug(dLog2, "S%d is Candidate, received heartbeat appendEntries from S%d at Term T%d, converting to follower.", rf.me, args.LeaderId, args.Term)
-			rf.swicthToFollower(args.Term, -1)
+			rf.swicthToFollower(args.Term, -1, true)
 		} else if rf.state == Follower {
 			Debug(dLog2, "S%d received heartbeat from S%d at Term T%d.", rf.me, args.LeaderId, args.Term)
 			rf.setHeartbeatTimeout(randTimeout(BaseHeartbeatTimeout))
@@ -210,12 +210,14 @@ func (rf *Raft) setElectionTimeout(timeout time.Duration) {
 	rf.electionTime = t
 }
 
-func (rf *Raft) swicthToFollower(term int, votedFor int) {
+func (rf *Raft) swicthToFollower(term int, votedFor int, refreshTimeout bool) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = votedFor
 	rf.persist(nil)
-	rf.setHeartbeatTimeout(randTimeout(BaseHeartbeatTimeout))
+	if refreshTimeout {
+		rf.setHeartbeatTimeout(randTimeout(BaseHeartbeatTimeout))
+	}
 }
 
 // return currentTerm and whether this server
@@ -234,6 +236,12 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Unlock()
 
 	return term, isleader
+}
+
+func (rf *Raft) GetMe() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.me
 }
 
 // save Raft's persistent state to stable storage,
@@ -364,7 +372,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	if args.Term > rf.currentTerm || (args.Term == rf.currentTerm && rf.state == Candidate) {
-		rf.swicthToFollower(args.Term, -1)
+		rf.swicthToFollower(args.Term, -1, true)
 	}
 
 	rf.snapshot = append([]byte{}, args.Snapshot...)
@@ -433,7 +441,7 @@ func (rf *Raft) leaderSendSnapshot(args *InstallSnapshotArgs, server int) {
 
 		if rf.currentTerm < reply.Term {
 			Debug(dSnap, "S%d Term is T%d, lower than S%d Term T%d, switching to follower.", rf.me, rf.currentTerm, server, reply.Term)
-			rf.swicthToFollower(reply.Term, -1)
+			rf.swicthToFollower(reply.Term, -1, true)
 			return
 		} else if rf.currentTerm > reply.Term {
 			Debug(dSnap, "S%d Term is T%d, higher than S%d Term T%d, invaild reply.", rf.me, rf.currentTerm, server, reply.Term)
@@ -479,7 +487,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currentTerm {
 		Debug(dVote, "S%d Term is T%d, lower than Term T%d, switching to follower and update the Term.", rf.me, rf.currentTerm, args.Term)
-		rf.swicthToFollower(args.Term, -1)
+		rf.swicthToFollower(args.Term, -1, false)
 	}
 
 	reply.Term = rf.currentTerm
@@ -500,7 +508,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// if not vote for other, vote for candidate
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		Debug(dVote, "S%d granting vote to S%d at Term T%d.", rf.me, args.CandidateId, args.Term)
-		rf.swicthToFollower(args.Term, args.CandidateId)
+		rf.swicthToFollower(args.Term, args.CandidateId, true)
 		reply.VotedGranted = true
 	} else {
 		Debug(dVote, "S%d has vote to S%d, rejecting vote to S%d at Term T%d.", rf.me, rf.votedFor, args.CandidateId, args.Term)
@@ -712,7 +720,7 @@ func (rf *Raft) candidateRequestVote(voteCnt *int, agrs *RequestVoteArgs, once *
 		} else if reply.Term > rf.currentTerm && !reply.VotedGranted && rf.state == Candidate {
 			Debug(dTerm, "S%d at Term T%d, receiving higher Term T%d reply from S%d. Switching to follower State.", rf.me, rf.currentTerm, reply.Term, server)
 			once.Do(func() {
-				rf.swicthToFollower(reply.Term, -1)
+				rf.swicthToFollower(reply.Term, -1, true)
 			})
 		} else if reply.VotedGranted {
 			Debug(dVote, "S%d getting votedGranted for S%d at Term T%d.", rf.me, server, rf.currentTerm)
@@ -793,7 +801,7 @@ func (rf *Raft) leaderSendEntries(args *AppendEntriesArgs, server int) {
 			return
 		} else if reply.Term > rf.currentTerm {
 			Debug(dLog, "S%d received a higher Term appendEntry reply from S%d at Term T%d, switching to follower.", rf.me, server, reply.Term)
-			rf.swicthToFollower(reply.Term, -1)
+			rf.swicthToFollower(reply.Term, -1, true)
 		} else {
 			if args.Term < rf.currentTerm {
 				Debug(dLog, "S%d Term T%d has changed, the appendEntry request Term T%d is outdated.", rf.me, rf.currentTerm, args.Term)

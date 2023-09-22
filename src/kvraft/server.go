@@ -1,28 +1,34 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
+const ExecuteTimeout int64 = 1
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key      string
+	Value    string
+	Command  string
+	ClientId int64
+	SeqId    int
+}
+
+type ApplyRes struct {
+	err      Err
+	value    string
+	clientId int64
+	seqId    int
 }
 
 type KVServer struct {
@@ -35,15 +41,212 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	lastApplied int
+	kvBD        map[string]string
+	notifyChans map[int]chan ApplyRes
+	lastOpRes   map[int64]ApplyRes
 }
 
+func (kv *KVServer) get(key string) (string, Err) {
+	if value, ok := kv.kvBD[key]; ok {
+		return value, OK
+	}
+	return "", ErrNoKey
+}
+
+func (kv *KVServer) put(key, value string) Err {
+	kv.kvBD[key] = value
+	return OK
+}
+
+func (kv *KVServer) append(key, value string) Err {
+	kv.kvBD[key] += value
+	return OK
+}
+
+func (kv *KVServer) isDuplicateRequest(clientId int64, seqId int) bool {
+	if res, ok := kv.lastOpRes[clientId]; ok {
+		return seqId == res.seqId
+	} else {
+		return false
+	}
+}
+
+func (kv *KVServer) makeNotifyChan(index int) chan ApplyRes {
+	kv.notifyChans[index] = make(chan ApplyRes)
+	return kv.notifyChans[index]
+}
+
+func (kv *KVServer) getNotifyChan(index int) chan ApplyRes {
+	if _, ok := kv.notifyChans[index]; ok {
+		return kv.notifyChans[index]
+	} else {
+		return nil
+	}
+
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	// if server isn't leader, reply err
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+		return
+	}
+	// if request is duplicate, reply the last result
+	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
+		reply.Err = kv.lastOpRes[args.ClientId].err
+		reply.Value = kv.lastOpRes[args.ClientId].value
+		kv.mu.Unlock()
+		DPrintf("DuplicateRequest! Reply the lastOpRes: err is %v.", reply)
+		return
+	}
+	// try to log the request
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:      args.Key,
+		Command:  opGet,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+	})
+	// to determine whether it is the leader again
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+		return
+	}
+	// create the notify chan
+	ch := kv.makeNotifyChan(index)
+	kv.mu.Unlock()
+	// wait for result
+	select {
+	case result := <-ch:
+		reply.Err, reply.Value = result.err, result.value
+	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
+		DPrintf("Execute Timeout!")
+		reply.Err = ErrExecuteTimeout
+	}
+	DPrintf("Reply is %v.", reply)
+	// delete the notify chan
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("Server %d Receive %v request from %d, key is %v, value is %v.", kv.rf.GetMe(), args.Op, args.ClientId, args.Key, args.Value)
+	kv.mu.Lock()
+	// if server isn't leader, reply err
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+		return
+	}
+	// if request is duplicate, reply the last result
+	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
+		reply.Err = kv.lastOpRes[args.ClientId].err
+		kv.mu.Unlock()
+		DPrintf("DuplicateRequest! Reply the lastOpRes: err is %v.", reply)
+		return
+	}
+	// try to log the request
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		Command:  args.Op,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+	})
+	// to determine whether it is the leader again
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+		return
+	}
+	// create the notify chan
+	ch := kv.makeNotifyChan(index)
+	kv.mu.Unlock()
+	// wait for result
+	select {
+	case result := <-ch:
+		reply.Err = result.err
+	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
+		DPrintf("Execute Timeout!")
+		reply.Err = ErrExecuteTimeout
+	}
+
+	DPrintf("Reply is %v.", reply)
+	// delete the notify chan
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
+	}()
+}
+
+func (kv *KVServer) applyLogToDB(op Op) ApplyRes {
+	applyRes := ApplyRes{
+		clientId: op.ClientId,
+		seqId:    op.SeqId,
+	}
+
+	switch op.Command {
+	case opGet:
+		applyRes.value, applyRes.err = kv.get(op.Key)
+		DPrintf("Server %d Apply %v to kvDB, key is %v.", kv.rf.GetMe(), op.Command, op.Key)
+	case opPut:
+		applyRes.err = kv.put(op.Key, op.Value)
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)
+	case opAppend:
+		applyRes.err = kv.append(op.Key, op.Value)
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)
+	}
+	return applyRes
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		if msg.CommandValid {
+			kv.mu.Lock()
+			// if log already apply, discard it
+			if msg.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				DPrintf("Log has already apply, discard it.")
+				continue
+			}
+
+			// if log doesn't apply, apply it and save the result
+			var applyRes ApplyRes
+			kv.lastApplied = msg.CommandIndex
+			op := msg.Command.(Op)
+			if kv.isDuplicateRequest(op.ClientId, op.SeqId) {
+				applyRes = kv.lastOpRes[op.ClientId]
+			} else {
+				applyRes = kv.applyLogToDB(op)
+				kv.lastOpRes[op.ClientId] = applyRes
+			}
+
+			// if server is leader, reply to client
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				if ch := kv.getNotifyChan(msg.CommandIndex); ch != nil {
+					ch <- applyRes
+				}
+			}
+
+			kv.mu.Unlock()
+		} else {
+			log.Fatalf("Invaild apply log: %v.", msg)
+		}
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +295,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.lastApplied = 0
+	kv.kvBD = make(map[string]string)
+	kv.notifyChans = make(map[int]chan ApplyRes)
+	kv.lastOpRes = make(map[int64]ApplyRes)
+
+	go kv.applier()
 
 	return kv
 }
