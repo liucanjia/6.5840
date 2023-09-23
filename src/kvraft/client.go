@@ -79,12 +79,15 @@ func (ck *Clerk) sendGet(key string, value *string) {
 			switch reply.Err {
 			case OK:
 				*value = reply.Value
-				fallthrough
+				DPrintf("Client %d get reply for the Get request, key is %v, value is %v.", args.ClientId, args.Key, reply.Value)
+				ck.updateLeader(leaderId)
+				return
 			case ErrNoKey:
 				DPrintf("Client %d Get request key is invaild.", args.ClientId)
 				ck.updateLeader(leaderId)
 				return
 			case ErrWrongLeader:
+				DPrintf("Client %d get reply for the Get request: %v.", args.ClientId, reply.Err)
 				leaderId = (leaderId + 1) % serverCnt
 			case ErrExecuteTimeout:
 				DPrintf("Client %d Get request executing timeout, retry.", args.ClientId)

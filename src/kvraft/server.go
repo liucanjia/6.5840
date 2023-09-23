@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -25,10 +26,10 @@ type Op struct {
 }
 
 type ApplyRes struct {
-	err      Err
-	value    string
-	clientId int64
-	seqId    int
+	Error    Err
+	Value    string
+	ClientId int64
+	SeqId    int
 }
 
 type KVServer struct {
@@ -66,7 +67,7 @@ func (kv *KVServer) append(key, value string) Err {
 
 func (kv *KVServer) isDuplicateRequest(clientId int64, seqId int) bool {
 	if res, ok := kv.lastOpRes[clientId]; ok {
-		return seqId == res.seqId
+		return seqId == res.SeqId
 	} else {
 		return false
 	}
@@ -98,10 +99,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	// if request is duplicate, reply the last result
 	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
-		reply.Err = kv.lastOpRes[args.ClientId].err
-		reply.Value = kv.lastOpRes[args.ClientId].value
+		reply.Err = kv.lastOpRes[args.ClientId].Error
+		reply.Value = kv.lastOpRes[args.ClientId].Value
 		kv.mu.Unlock()
-		DPrintf("DuplicateRequest! Reply the lastOpRes: err is %v.", reply)
+		DPrintf("DuplicateRequest! Reply the lastOpRes: reply is %v.", reply)
 		return
 	}
 	// try to log the request
@@ -124,7 +125,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// wait for result
 	select {
 	case result := <-ch:
-		reply.Err, reply.Value = result.err, result.value
+		reply.Err, reply.Value = result.Error, result.Value
 	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
 		DPrintf("Execute Timeout!")
 		reply.Err = ErrExecuteTimeout
@@ -151,7 +152,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	// if request is duplicate, reply the last result
 	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
-		reply.Err = kv.lastOpRes[args.ClientId].err
+		reply.Err = kv.lastOpRes[args.ClientId].Error
 		kv.mu.Unlock()
 		DPrintf("DuplicateRequest! Reply the lastOpRes: err is %v.", reply)
 		return
@@ -177,7 +178,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// wait for result
 	select {
 	case result := <-ch:
-		reply.Err = result.err
+		reply.Err = result.Error
 	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
 		DPrintf("Execute Timeout!")
 		reply.Err = ErrExecuteTimeout
@@ -194,20 +195,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) applyLogToDB(op Op) ApplyRes {
 	applyRes := ApplyRes{
-		clientId: op.ClientId,
-		seqId:    op.SeqId,
+		ClientId: op.ClientId,
+		SeqId:    op.SeqId,
 	}
 
 	switch op.Command {
 	case opGet:
-		applyRes.value, applyRes.err = kv.get(op.Key)
-		DPrintf("Server %d Apply %v to kvDB, key is %v.", kv.rf.GetMe(), op.Command, op.Key)
+		applyRes.Value, applyRes.Error = kv.get(op.Key)
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, kv.kvBD[op.Key])
 	case opPut:
-		applyRes.err = kv.put(op.Key, op.Value)
+		applyRes.Error = kv.put(op.Key, op.Value)
 		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)
 	case opAppend:
-		applyRes.err = kv.append(op.Key, op.Value)
-		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)
+		applyRes.Error = kv.append(op.Key, op.Value)
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v, now value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value, kv.kvBD[op.Key])
 	}
 	return applyRes
 }
@@ -217,10 +218,11 @@ func (kv *KVServer) applier() {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
 			kv.mu.Lock()
+			DPrintf("Server %d try to apply Log %d, Log is %v.", kv.me, msg.CommandIndex, msg.Command.(Op))
 			// if log already apply, discard it
 			if msg.CommandIndex <= kv.lastApplied {
 				kv.mu.Unlock()
-				DPrintf("Log has already apply, discard it.")
+				DPrintf("Server %d, Log has already apply, discard it.", kv.me)
 				continue
 			}
 
@@ -229,6 +231,7 @@ func (kv *KVServer) applier() {
 			kv.lastApplied = msg.CommandIndex
 			op := msg.Command.(Op)
 			if kv.isDuplicateRequest(op.ClientId, op.SeqId) {
+				DPrintf("Server %d doesn't apply Log %d, because is duplicate.", kv.me, msg.CommandIndex)
 				applyRes = kv.lastOpRes[op.ClientId]
 			} else {
 				applyRes = kv.applyLogToDB(op)
@@ -242,11 +245,65 @@ func (kv *KVServer) applier() {
 				}
 			}
 
+			if needSnapshot := kv.needSnapshot(); needSnapshot {
+				kv.snapshot(msg.CommandIndex)
+			}
+
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			DPrintf("Server %d try to apply snapshot throught index %d.", kv.me, msg.SnapshotIndex)
+			kv.applySnapshot(msg.Snapshot)
+			kv.lastApplied = msg.SnapshotIndex
 			kv.mu.Unlock()
 		} else {
 			log.Fatalf("Invaild apply log: %v.", msg)
 		}
 	}
+}
+
+func (kv *KVServer) snapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if err := e.Encode(&kv.kvBD); err != nil {
+		DPrintf("Server %d can not encode the kvDB.", kv.me)
+	}
+
+	if err := e.Encode(&kv.lastOpRes); err != nil {
+		DPrintf("Server %d can not encode the lastOpRes.", kv.me)
+	}
+
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&kv.kvBD); err != nil {
+		DPrintf("Server %d can not decode the kvDB.", kv.me)
+	}
+
+	if err := d.Decode(&kv.lastOpRes); err != nil {
+		DPrintf("Server %d can not decode the lastOpRes.", kv.me)
+	}
+}
+
+func (kv *KVServer) needSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	if kv.maxraftstate <= kv.rf.GetRaftStateSize() {
+		return true
+	}
+
+	return false
 }
 
 // the tester calls Kill() when a KVServer instance won't

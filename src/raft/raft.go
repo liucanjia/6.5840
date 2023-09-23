@@ -244,6 +244,12 @@ func (rf *Raft) GetMe() int {
 	return rf.me
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.persister.RaftStateSize()
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -367,7 +373,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		Debug(dSnap, "S%d rejects to insatll snapshot because Term T%d higher than S%d Term T%d.", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 		return
 	} else if args.LastIncludeIndex <= rf.lastIncludedIndex {
-		Debug(dSnap, "S%d rejects to insatll snapshot because lastIncludedIndex %d do not smaller than S%d lastIncludedIndex %d.", rf.me, rf.currentTerm, rf.lastIncludedIndex, args.LastIncludeIndex)
+		Debug(dSnap, "S%d rejects to insatll snapshot because lastIncludedIndex %d do not smaller than S%d lastIncludedIndex %d.", rf.me, rf.lastIncludedIndex, args.LeaderId, args.LastIncludeIndex)
 		return
 	}
 
@@ -378,13 +384,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshot = append([]byte{}, args.Snapshot...)
 	// cut the old logEntry
 	lastLogIndex, _ := rf.getLastInfo()
-	rf.lastIncludedIndex = args.LastIncludeIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
-	if lastLogIndex > rf.lastIncludedIndex {
-		rf.logs = rf.getLogsSlice(rf.lastIncludedIndex+1, lastLogIndex+1)
+	if lastLogIndex > args.LastIncludeIndex {
+		rf.logs = rf.getLogsSlice(args.LastIncludeIndex+1, lastLogIndex+1)
 	} else {
 		rf.logs = LogEntries{}
 	}
+	rf.lastIncludedIndex = args.LastIncludeIndex
 
 	rf.persist(rf.snapshot)
 	reply.Term = rf.currentTerm
@@ -412,6 +418,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.snapshot = snapshot
 
+	Debug(dSnap, "S%d now logs is %v.", rf.me, rf.logs)
 	rf.persist(rf.snapshot)
 }
 
@@ -756,9 +763,9 @@ func (rf *Raft) buildAppendEntriesArgs(args *AppendEntriesArgs, lastLogIndex, se
 	args.LeaderCommit = rf.commitIndex
 
 	if lastLogIndex >= nextIndex {
-		Debug(dLog, "S%d send logEnrties from %d -> %d to S%d.", rf.me, nextIndex, lastLogIndex, server)
 		args.Entries = make(LogEntries, lastLogIndex-nextIndex+1)
 		copy(args.Entries, rf.getLogsSlice(nextIndex, lastLogIndex+1))
+		Debug(dLog, "S%d send logEnrties from %d -> %d to S%d, logs is %v.", rf.me, nextIndex, lastLogIndex, server, args.Entries)
 	}
 }
 
@@ -840,8 +847,8 @@ func (rf *Raft) updateNextIndex(xTerm, xIndex, xLen, server int) {
 
 	flag := false
 	idx := rf.nextIndex[server]
-	// nextIndex at least must be 1
-	for ; idx > 1 && idx > rf.matchIndex[server]; idx-- {
+	// nextIndex must large than lastIncludedIndex
+	for ; idx > rf.lastIncludedIndex && idx > rf.matchIndex[server]; idx-- {
 		if rf.getEntry(idx).Term == xTerm {
 			flag = true
 			break
@@ -926,9 +933,11 @@ func (rf *Raft) applyLogsLoop(applyCh chan ApplyMsg) {
 func (rf *Raft) matchLog(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
 
+	Debug(dLog2, "S%d try to match log with S%d.", rf.me, args.LeaderId)
 	// if logEntries have been snapshot, discard the old logEntry
 	if args.PrevLogIndex < rf.lastIncludedIndex {
-		newLogBeginIndex := rf.lastIncludedIndex - args.PrevLogIndex
+		// fix the bug that logEntry is too old, so discard all logEntry
+		newLogBeginIndex := min(rf.lastIncludedIndex-args.PrevLogIndex, len(args.Entries))
 		newArgs := &AppendEntriesArgs{
 			Term:         args.Term,
 			LeaderId:     args.LeaderId,
