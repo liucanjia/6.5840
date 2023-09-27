@@ -114,9 +114,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	})
 	// to determine whether it is the leader again
 	if !isLeader {
+		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
 		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
-		DPrintf("Server %d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
 		return
 	}
 	// create the notify chan
@@ -221,8 +221,8 @@ func (kv *KVServer) applier() {
 			DPrintf("Server %d try to apply Log %d, Log is %v.", kv.me, msg.CommandIndex, msg.Command.(Op))
 			// if log already apply, discard it
 			if msg.CommandIndex <= kv.lastApplied {
-				kv.mu.Unlock()
 				DPrintf("Server %d, Log has already apply, discard it.", kv.me)
+				kv.mu.Unlock()
 				continue
 			}
 
@@ -231,7 +231,7 @@ func (kv *KVServer) applier() {
 			kv.lastApplied = msg.CommandIndex
 			op := msg.Command.(Op)
 			if kv.isDuplicateRequest(op.ClientId, op.SeqId) {
-				DPrintf("Server %d doesn't apply Log %d, because is duplicate.", kv.me, msg.CommandIndex)
+				DPrintf("Server %d doesn't apply Log %d, because it's duplicate.", kv.me, msg.CommandIndex)
 				applyRes = kv.lastOpRes[op.ClientId]
 			} else {
 				applyRes = kv.applyLogToDB(op)

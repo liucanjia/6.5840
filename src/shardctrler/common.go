@@ -1,5 +1,7 @@
 package shardctrler
 
+import "log"
+
 //
 // Shard controler: assigns shards to replication groups.
 //
@@ -19,6 +21,7 @@ package shardctrler
 
 // The number of shards.
 const NShards = 10
+const Debug = false
 
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
@@ -29,13 +32,25 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK                = "OK"
+	ErrExecuteTimeout = "ErrExecuteTimeout"
+
+	opJoin  = "Join"
+	opLeave = "Leave"
+	opMove  = "Move"
+	opQuery = "Query"
 )
 
 type Err string
 
+type ClientInfo struct {
+	ClientId int64
+	SeqId    int
+}
+
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	Client  ClientInfo
 }
 
 type JoinReply struct {
@@ -44,7 +59,8 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs   []int
+	Client ClientInfo
 }
 
 type LeaveReply struct {
@@ -53,8 +69,9 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard  int
+	GID    int
+	Client ClientInfo
 }
 
 type MoveReply struct {
@@ -63,11 +80,18 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num    int // desired config number
+	Client ClientInfo
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+func DPrintf(format string, a ...interface{}) {
+	if Debug {
+		log.Printf(format, a...)
+	}
 }
