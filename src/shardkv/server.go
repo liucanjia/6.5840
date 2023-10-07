@@ -1,17 +1,48 @@
 package shardkv
 
+import (
+	"sync"
+	"sync/atomic"
+	"time"
 
-import "6.5840/labrpc"
-import "6.5840/raft"
-import "sync"
-import "6.5840/labgob"
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+	"6.5840/shardctrler"
+)
 
+const (
+	ExecuteTimeout        int64 = 1   // 1s
+	ConfigQueryInterval   int64 = 100 // 100ms
+	ReConfiguringInterval int64 = 100
+)
 
+type ShardState int
+
+const (
+	Serving ShardState = iota
+	Pulling
+	Pushing
+	Invalid
+)
+
+type shardDB struct {
+	state ShardState
+	db    map[string]string
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key      string
+	Value    string
+	Command  string
+	ClientId int64
+	SeqId    int
+
+	Shards    [shardctrler.NShards]int
+	ConfigNum int
 }
 
 type ShardKV struct {
@@ -25,11 +56,32 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dead        int32 // set by Kill()
+	lastApplied int
+	shardDBs    []shardDB
+	configClerk *shardctrler.Clerk
+	configNum   int
 }
-
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	// if server isn't leader, reject it
+	if !kv.isLeader() {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Server%d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+	}
+	// if server isn't responsible for shard, reject it
+
+	// try to log the request
+
+	// to determine whether it is the leader agin
+
+	// creqte the notify chan
+
+	// delete the notify chan
+	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -43,8 +95,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
 }
 
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
 
 // servers[] contains the ports of the servers in this group.
 //
@@ -85,13 +142,120 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	kv.lastApplied = 0
+	kv.configNum = 0
+	kv.shardDBs = make([]shardDB, shardctrler.NShards)
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.configClerk = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.applier()
+	go kv.fetchConfigLoop()
+	//go kv.migrateShardLoop()
 
 	return kv
+}
+
+func (kv *ShardKV) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		if msg.CommandValid {
+			kv.mu.Lock()
+			DPrintf("Server%d try to apply Log%d, Log: %v.", kv.rf.GetMe(), msg.CommandIndex, msg.Command.(Op))
+			// if log already apply, discard it
+			if msg.CommandIndex <= kv.lastApplied {
+				DPrintf("Server%d has already apply the Log%d, discard it.", kv.rf.GetMe(), msg.CommandIndex)
+				kv.mu.Unlock()
+				continue
+			}
+
+			kv.lastApplied = msg.CommandIndex
+			op := msg.Command.(Op)
+			switch op.Command {
+			case opConfig:
+				// if it't config update log, apply it
+				kv.applyConfig(op.ConfigNum, op.Shards)
+			default:
+
+			}
+
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *ShardKV) fetchConfigLoop() {
+	for !kv.killed() {
+		kv.mu.Lock()
+
+		if kv.isLeader() {
+			configNum := kv.configNum
+			kv.mu.Unlock()
+
+			newConfig := kv.configClerk.Query(configNum + 1)
+			// if config is new, update config
+			if newConfig.Num > configNum {
+				DPrintf("Server%d update config%d -> %d, newShard: %v", kv.rf.GetMe(), configNum, newConfig.Num, newConfig.Shards)
+				kv.updateConfig(newConfig)
+			}
+		} else {
+			kv.mu.Unlock()
+		}
+
+		time.Sleep(time.Duration(ConfigQueryInterval) * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) applyConfig(num int, shards [10]int) {
+	// wait for the last reconfiguration finish
+	for !kv.isReConfiguring() {
+		time.Sleep(time.Duration(ReConfiguringInterval) * time.Millisecond)
+	}
+
+	// update config version
+	kv.configNum = num
+	// update shard config
+	for i, gid := range shards {
+		if gid == kv.gid {
+			// wait for receving shard
+			if kv.shardDBs[i].state == Serving {
+				kv.shardDBs[i].state = Pulling
+				kv.shardDBs[i].db = make(map[string]string)
+			}
+		} else {
+			// set pushing, and the send shard to new owner
+			if kv.shardDBs[i].state == Serving {
+				kv.shardDBs[i].state = Pushing
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
+	kv.mu.Lock()
+	// log the new config
+	kv.rf.Start(Op{
+		Command:   opConfig,
+		ConfigNum: newConfig.Num,
+		Shards:    newConfig.Shards,
+	})
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) isReConfiguring() bool {
+	// if any shard is at pulling state or pushing state, that mean reconfiguration doesn't finish
+	for _, shardDB := range kv.shardDBs {
+		if shardDB.state == Pulling || shardDB.state == Pushing {
+			return false
+		}
+	}
+	return true
+}
+
+func (kv *ShardKV) isLeader() bool {
+	_, isLeader := kv.rf.GetState()
+	return isLeader
 }

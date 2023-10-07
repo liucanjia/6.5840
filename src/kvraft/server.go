@@ -43,25 +43,25 @@ type KVServer struct {
 
 	// Your definitions here.
 	lastApplied int
-	kvBD        map[string]string
+	kvDB        map[string]string
 	notifyChans map[int]chan ApplyRes
 	lastOpRes   map[int64]ApplyRes
 }
 
 func (kv *KVServer) get(key string) (string, Err) {
-	if value, ok := kv.kvBD[key]; ok {
+	if value, ok := kv.kvDB[key]; ok {
 		return value, OK
 	}
 	return "", ErrNoKey
 }
 
 func (kv *KVServer) put(key, value string) Err {
-	kv.kvBD[key] = value
+	kv.kvDB[key] = value
 	return OK
 }
 
 func (kv *KVServer) append(key, value string) Err {
-	kv.kvBD[key] += value
+	kv.kvDB[key] += value
 	return OK
 }
 
@@ -202,13 +202,13 @@ func (kv *KVServer) applyLogToDB(op Op) ApplyRes {
 	switch op.Command {
 	case opGet:
 		applyRes.Value, applyRes.Error = kv.get(op.Key)
-		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, kv.kvBD[op.Key])
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, kv.kvDB[op.Key])
 	case opPut:
 		applyRes.Error = kv.put(op.Key, op.Value)
 		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)
 	case opAppend:
 		applyRes.Error = kv.append(op.Key, op.Value)
-		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v, now value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value, kv.kvBD[op.Key])
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v, now value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value, kv.kvDB[op.Key])
 	}
 	return applyRes
 }
@@ -266,7 +266,7 @@ func (kv *KVServer) snapshot(index int) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	if err := e.Encode(&kv.kvBD); err != nil {
+	if err := e.Encode(&kv.kvDB); err != nil {
 		DPrintf("Server %d can not encode the kvDB.", kv.me)
 	}
 
@@ -285,7 +285,7 @@ func (kv *KVServer) applySnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
-	if err := d.Decode(&kv.kvBD); err != nil {
+	if err := d.Decode(&kv.kvDB); err != nil {
 		DPrintf("Server %d can not decode the kvDB.", kv.me)
 	}
 
@@ -353,7 +353,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.lastApplied = 0
-	kv.kvBD = make(map[string]string)
+	kv.kvDB = make(map[string]string)
 	kv.notifyChans = make(map[int]chan ApplyRes)
 	kv.lastOpRes = make(map[int64]ApplyRes)
 
