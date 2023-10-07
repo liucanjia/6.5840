@@ -54,6 +54,23 @@ type GetReply struct {
 	Value string
 }
 
+type SendShardArgs struct {
+	configNum int
+	shard     map[string]string
+}
+
+type SendShardReply struct {
+	Err Err
+}
+
+type ReceiveShardDoneArgs struct {
+	Err Err
+}
+
+type ReceiveShardDoneReply struct {
+	Err Err
+}
+
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
 		log.Printf(format, a...)

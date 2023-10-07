@@ -15,6 +15,7 @@ const (
 	ExecuteTimeout        int64 = 1   // 1s
 	ConfigQueryInterval   int64 = 100 // 100ms
 	ReConfiguringInterval int64 = 100
+	MigrateInterval       int64 = 100
 )
 
 type ShardState int
@@ -41,8 +42,7 @@ type Op struct {
 	ClientId int64
 	SeqId    int
 
-	Shards    [shardctrler.NShards]int
-	ConfigNum int
+	Config shardctrler.Config
 }
 
 type ShardKV struct {
@@ -59,8 +59,8 @@ type ShardKV struct {
 	dead        int32 // set by Kill()
 	lastApplied int
 	shardDBs    []shardDB
-	configClerk *shardctrler.Clerk
-	configNum   int
+	config      shardctrler.Config
+	scClerk     *shardctrler.Clerk
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -86,6 +86,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+}
+
+func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
+
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -143,18 +147,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.lastApplied = 0
-	kv.configNum = 0
+	kv.config = shardctrler.Config{}
 	kv.shardDBs = make([]shardDB, shardctrler.NShards)
 
 	// Use something like this to talk to the shardctrler:
-	kv.configClerk = shardctrler.MakeClerk(kv.ctrlers)
+	kv.scClerk = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applier()
 	go kv.fetchConfigLoop()
-	//go kv.migrateShardLoop()
+	go kv.migrateShardLoop()
 
 	return kv
 }
@@ -177,7 +181,7 @@ func (kv *ShardKV) applier() {
 			switch op.Command {
 			case opConfig:
 				// if it't config update log, apply it
-				kv.applyConfig(op.ConfigNum, op.Shards)
+				kv.applyConfig(op.Config)
 			default:
 
 			}
@@ -192,10 +196,10 @@ func (kv *ShardKV) fetchConfigLoop() {
 		kv.mu.Lock()
 
 		if kv.isLeader() {
-			configNum := kv.configNum
+			configNum := kv.config.Num
 			kv.mu.Unlock()
 
-			newConfig := kv.configClerk.Query(configNum + 1)
+			newConfig := kv.scClerk.Query(configNum + 1)
 			// if config is new, update config
 			if newConfig.Num > configNum {
 				DPrintf("Server%d update config%d -> %d, newShard: %v", kv.rf.GetMe(), configNum, newConfig.Num, newConfig.Shards)
@@ -209,16 +213,56 @@ func (kv *ShardKV) fetchConfigLoop() {
 	}
 }
 
-func (kv *ShardKV) applyConfig(num int, shards [10]int) {
+func (kv *ShardKV) migrateShardLoop() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		for idx, shardDB := range kv.shardDBs {
+			if shardDB.state == Pushing {
+				// try to send shard to new owner
+				args := SendShardArgs{
+					configNum: kv.config.Num,
+					shard:     make(map[string]string),
+				}
+				for key, value := range shardDB.db {
+					args.shard[key] = value
+				}
+
+				gid := kv.config.Shards[idx]
+				DPrintf("Server%d send shard%d to Group%d in config%d.", kv.rf.GetMe(), idx, gid, kv.config.Num)
+				if servers, ok := kv.config.Groups[gid]; ok {
+					// try each server for the shard.
+					for si := 0; si < len(servers); si = (si + 1) % len(servers) {
+						srv := kv.make_end(servers[si])
+						var reply SendShardReply
+						ok := srv.Call("ShardKV.SendShard", &args, &reply)
+						if ok && reply.Err == OK {
+							break
+						}
+					}
+				}
+			}
+		}
+
+		kv.mu.Unlock()
+		time.Sleep(time.Duration(MigrateInterval) * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) applyConfig(newConfig shardctrler.Config) {
 	// wait for the last reconfiguration finish
 	for !kv.isReConfiguring() {
 		time.Sleep(time.Duration(ReConfiguringInterval) * time.Millisecond)
 	}
 
-	// update config version
-	kv.configNum = num
-	// update shard config
-	for i, gid := range shards {
+	// update config
+	kv.config.Num = newConfig.Num
+	kv.config.Shards = newConfig.Shards
+	kv.config.Groups = make(map[int][]string)
+	for gid, servers := range newConfig.Groups {
+		kv.config.Groups[gid] = append([]string{}, servers...)
+	}
+	// update shard state
+	for i, gid := range newConfig.Shards {
 		if gid == kv.gid {
 			// wait for receving shard
 			if kv.shardDBs[i].state == Serving {
@@ -237,11 +281,18 @@ func (kv *ShardKV) applyConfig(num int, shards [10]int) {
 func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
 	kv.mu.Lock()
 	// log the new config
-	kv.rf.Start(Op{
-		Command:   opConfig,
-		ConfigNum: newConfig.Num,
-		Shards:    newConfig.Shards,
-	})
+	command := Op{
+		Command: opConfig,
+		Config: shardctrler.Config{
+			Num:    newConfig.Num,
+			Shards: newConfig.Shards,
+			Groups: make(map[int][]string),
+		},
+	}
+	for gid, servers := range newConfig.Groups {
+		command.Config.Groups[gid] = append([]string{}, servers...)
+	}
+	kv.rf.Start(command)
 	kv.mu.Unlock()
 }
 
