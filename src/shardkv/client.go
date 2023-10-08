@@ -75,13 +75,10 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
 					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
+				} else if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					break
-				}
-				// ... not ok, or ErrWrongLeader
-				if ok && reply.Err == ErrWrongLeader {
+				} else if ok && (reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout) { // ... not ok, or ErrWrongLeader
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					continue
 				}
@@ -117,13 +114,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.Err == OK {
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
 					return
-				}
-				if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
+				} else if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					break
-				}
-				// ... not ok, or ErrWrongLeader
-				if ok && reply.Err == ErrWrongLeader {
+				} else if ok && (reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout) { // ... not ok, or ErrWrongLeader
 					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					continue
 				}

@@ -100,6 +100,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		DPrintf("Group%dServer%d isn't responsible for key%v.", kv.gid, kv.me, args.Key)
 		return
 	}
+	// if shard isn't at serving, return pause serve
+	if idx := key2shard(args.Key); kv.shardDBs[idx].State != Serving {
+		reply.Err = ErrPauseServe
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d pause serving.", kv.gid, kv.me)
+		return
+	}
 	// if request is duplicate, reply the last result
 	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
 		reply.Err = kv.lastOpRes[args.ClientId].Err
@@ -155,6 +162,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		DPrintf("Group%dServer%d isn't responsible for key%v.", kv.gid, kv.me, args.Key)
+		return
+	}
+	// if shard isn't at serving, return pause serve
+	if idx := key2shard(args.Key); kv.shardDBs[idx].State != Serving {
+		reply.Err = ErrPauseServe
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d pause serving.", kv.gid, kv.me)
 		return
 	}
 	// if request is duplicate, reply the last result
@@ -484,13 +498,19 @@ func (kv *ShardKV) applyLogToDB(op Op) ApplyRes {
 	switch op.Command {
 	case opGet:
 		applyRes.Value, applyRes.Err = kv.get(op.Key)
-		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, applyRes.Value)
+		if applyRes.Err == OK {
+			DPrintf("Group%dServer%d Apply %v to shardDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, applyRes.Value)
+		}
 	case opPut:
 		applyRes.Err = kv.put(op.Key, op.Value)
-		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+		if applyRes.Err == OK {
+			DPrintf("Group%dServer%d Apply %v to shardDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+		}
 	case opAppend:
 		applyRes.Err = kv.append(op.Key, op.Value)
-		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+		if applyRes.Err == OK {
+			DPrintf("Group%dServer%d Apply %v to shardDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+		}
 	}
 	return applyRes
 }
@@ -540,7 +560,7 @@ func (kv *ShardKV) fetchConfigLoop() {
 	for !kv.killed() {
 		kv.mu.Lock()
 
-		if kv.isLeader() {
+		if kv.isLeader() && !kv.isReConfiguring() {
 			configNum := kv.config.Num
 			kv.mu.Unlock()
 
@@ -639,11 +659,6 @@ func (kv *ShardKV) clearShard(shard ShardInfo) {
 }
 
 func (kv *ShardKV) applyConfig(newConfig shardctrler.Config) {
-	// wait for the last reconfiguration finish
-	for !kv.isReConfiguring() {
-		time.Sleep(time.Duration(ReConfiguringInterval) * time.Millisecond)
-	}
-
 	// update config
 	kv.config.Num = newConfig.Num
 	kv.config.Shards = newConfig.Shards
@@ -675,6 +690,7 @@ func (kv *ShardKV) applyConfig(newConfig shardctrler.Config) {
 			}
 		}
 	}
+	DPrintf("Group%dServer%d update to Config%d.", kv.gid, kv.me, kv.config.Num)
 }
 
 func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
@@ -696,11 +712,11 @@ func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
 func (kv *ShardKV) isReConfiguring() bool {
 	// if any shard is at pulling state or pushing state, that mean reconfiguration doesn't finish
 	for _, shardDB := range kv.shardDBs {
-		if shardDB.State == Pulling || shardDB.State == Pushing {
-			return false
+		if shardDB.State == Pulling {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func (kv *ShardKV) isLeader() bool {
