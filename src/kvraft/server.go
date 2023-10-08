@@ -141,7 +141,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("Server %d Receive %v request from %d, key is %v, value is %v.", kv.rf.GetMe(), args.Op, args.ClientId, args.Key, args.Value)
+	DPrintf("Server %d receive %v request from %d, key is %v, value is %v.", kv.rf.GetMe(), args.Op, args.ClientId, args.Key, args.Value)
 	kv.mu.Lock()
 	// if server isn't leader, reply err
 	if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -202,7 +202,7 @@ func (kv *KVServer) applyLogToDB(op Op) ApplyRes {
 	switch op.Command {
 	case opGet:
 		applyRes.Value, applyRes.Error = kv.get(op.Key)
-		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, kv.kvDB[op.Key])
+		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, applyRes.Value)
 	case opPut:
 		applyRes.Error = kv.put(op.Key, op.Value)
 		DPrintf("Server %d Apply %v to kvDB, key is %v, value is %v.", kv.rf.GetMe(), op.Command, op.Key, op.Value)

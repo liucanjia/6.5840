@@ -1,6 +1,10 @@
 package shardkv
 
-import "log"
+import (
+	"log"
+
+	"6.5840/shardctrler"
+)
 
 //
 // Sharded key/value server.
@@ -17,8 +21,16 @@ const (
 	ErrWrongGroup     = "ErrWrongGroup"
 	ErrWrongLeader    = "ErrWrongLeader"
 	ErrExecuteTimeout = "ErrExecuteTimeout"
+	ErrWrongOwner     = "ErrWrongOwner"
+	ErrPauseServe     = "ErrPauseServe"
+	ErrWrongConfigNum = "ErrWrongConfigNum"
 
-	opConfig = "opConfig"
+	opGet        = "opGet"
+	opPut        = "Put"
+	opAppend     = "Append"
+	opConfig     = "opConfig"
+	opShard      = "opShard"
+	opShardClear = "opShardClear"
 )
 
 const Debug = false
@@ -54,21 +66,26 @@ type GetReply struct {
 	Value string
 }
 
-type SendShardArgs struct {
-	configNum int
-	shard     map[string]string
+type ShardArgs struct {
+	ConfigNum int
+	ShardIdx  int
+	Shard     map[string]string
 }
 
-type SendShardReply struct {
+type ShardReply struct {
 	Err Err
 }
 
-type ReceiveShardDoneArgs struct {
-	Err Err
-}
-
-type ReceiveShardDoneReply struct {
-	Err Err
+// which shard is a key in?
+// please use this function,
+// and please do not change it.
+func key2shard(key string) int {
+	shard := 0
+	if len(key) > 0 {
+		shard = int(key[0])
+	}
+	shard %= shardctrler.NShards
+	return shard
 }
 
 func DPrintf(format string, a ...interface{}) {

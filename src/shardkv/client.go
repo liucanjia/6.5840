@@ -17,18 +17,6 @@ import (
 	"6.5840/shardctrler"
 )
 
-// which shard is a key in?
-// please use this function,
-// and please do not change it.
-func key2shard(key string) int {
-	shard := 0
-	if len(key) > 0 {
-		shard = int(key[0])
-	}
-	shard %= shardctrler.NShards
-	return shard
-}
-
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -85,12 +73,18 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
+				if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
+				if ok && reply.Err == ErrWrongLeader {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+					continue
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -121,12 +115,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
 					return
 				}
-				if ok && reply.Err == ErrWrongGroup {
+				if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
 					break
 				}
 				// ... not ok, or ErrWrongLeader
+				if ok && reply.Err == ErrWrongLeader {
+					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+					continue
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)

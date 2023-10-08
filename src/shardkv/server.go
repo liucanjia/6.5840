@@ -1,6 +1,8 @@
 package shardkv
 
 import (
+	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,20 +18,28 @@ const (
 	ConfigQueryInterval   int64 = 100 // 100ms
 	ReConfiguringInterval int64 = 100
 	MigrateInterval       int64 = 100
+
+	InitConfigNum int = 1
 )
 
 type ShardState int
 
 const (
-	Serving ShardState = iota
+	Invalid ShardState = iota
+	Serving
 	Pulling
 	Pushing
-	Invalid
 )
 
-type shardDB struct {
-	state ShardState
-	db    map[string]string
+type ShardDB struct {
+	State ShardState
+	DB    map[string]string
+}
+
+type ShardInfo struct {
+	Num   int
+	Idx   int
+	Shard map[string]string
 }
 
 type Op struct {
@@ -43,6 +53,14 @@ type Op struct {
 	SeqId    int
 
 	Config shardctrler.Config
+	Shard  ShardInfo
+}
+
+type ApplyRes struct {
+	Err      Err
+	Value    string
+	ClientId int64
+	SeqId    int
 }
 
 type ShardKV struct {
@@ -58,9 +76,11 @@ type ShardKV struct {
 	// Your definitions here.
 	dead        int32 // set by Kill()
 	lastApplied int
-	shardDBs    []shardDB
+	shardDBs    []ShardDB
 	config      shardctrler.Config
 	scClerk     *shardctrler.Clerk
+	notifyChans map[int]chan ApplyRes
+	lastOpRes   map[int64]ApplyRes
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -70,26 +90,201 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	if !kv.isLeader() {
 		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
-		DPrintf("Server%d isn't leader! Reply errWrongLeader.", kv.rf.GetMe())
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		return
 	}
 	// if server isn't responsible for shard, reject it
-
+	if idx := key2shard(args.Key); kv.config.Shards[idx] != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d isn't responsible for key%v.", kv.gid, kv.me, args.Key)
+		return
+	}
+	// if request is duplicate, reply the last result
+	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
+		reply.Err = kv.lastOpRes[args.ClientId].Err
+		reply.Value = kv.lastOpRes[args.ClientId].Value
+		kv.mu.Unlock()
+		DPrintf("DuplicateRequest! Reply the lastOpRes: reply is %v.", reply)
+		return
+	}
 	// try to log the request
-
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:      args.Key,
+		Command:  opGet,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+	})
 	// to determine whether it is the leader agin
-
-	// creqte the notify chan
-
-	// delete the notify chan
+	if !isLeader {
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		kv.mu.Unlock()
+		return
+	}
+	// create the notify chan
+	ch := kv.makeNotifyChan(index)
 	kv.mu.Unlock()
+	select {
+	case result := <-ch:
+		reply.Err, reply.Value = result.Err, result.Value
+	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
+		DPrintf("Group%dServer%d execute Timeout!", kv.gid, kv.me)
+		reply.Err = ErrExecuteTimeout
+	}
+	// delete the notify chan
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("Group%dServer%d receive %v request from Client%d, key is %v, value is %v.", kv.gid, kv.me, args.Op, args.ClientId, args.Key, args.Value)
+	kv.mu.Lock()
+	// if server isn't leader, reject it
+	if !kv.isLeader() {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		return
+	}
+	// if server isn't responsible for shard, reject it
+	if idx := key2shard(args.Key); kv.config.Shards[idx] != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d isn't responsible for key%v.", kv.gid, kv.me, args.Key)
+		return
+	}
+	// if request is duplicate, reply the last result
+	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
+		reply.Err = kv.lastOpRes[args.ClientId].Err
+		kv.mu.Unlock()
+		DPrintf("DuplicateRequest! Reply the lastOpRes: reply is %v.", reply)
+		return
+	}
+	// try to log the request
+	index, _, isLeader := kv.rf.Start(Op{
+		Key:      args.Key,
+		Value:    args.Value,
+		Command:  args.Op,
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
+	})
+	// to determine whether it is the leader agin
+	if !isLeader {
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		kv.mu.Unlock()
+		return
+	}
+	// create the notify chan
+	ch := kv.makeNotifyChan(index)
+	kv.mu.Unlock()
+	select {
+	case result := <-ch:
+		reply.Err = result.Err
+	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
+		DPrintf("Group%dServer%d execute Timeout!", kv.gid, kv.me)
+		reply.Err = ErrExecuteTimeout
+	}
+	// delete the notify chan
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
+	}()
 }
 
-func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
+func (kv *ShardKV) isDuplicateRequest(clientId int64, seqId int) bool {
+	if res, ok := kv.lastOpRes[clientId]; ok && (res.Err == OK || res.Err == ErrNoKey) {
+		return seqId == res.SeqId
+	} else {
+		return false
+	}
+}
 
+func (kv *ShardKV) Shard(args *ShardArgs, reply *ShardReply) {
+	kv.mu.Lock()
+	// if server isn't leader, reply err
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		return
+	}
+	// if group isn't the owner of shard, reject it
+	if kv.config.Shards[args.ShardIdx] != kv.gid {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		DPrintf("Group%d isn't the owner of shard%d! Reply errWrongGroup.", kv.gid, args.ShardIdx)
+		return
+	}
+	// if shard is old, reply ok
+	if args.ConfigNum < kv.config.Num || (args.ConfigNum == kv.config.Num && kv.shardDBs[args.ShardIdx].State == Serving) {
+		reply.Err = OK
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d configNum is %d, shardState is %v, args.configNum is %d.", kv.gid, kv.me, kv.config.Num, kv.shardDBs[args.ShardIdx].State, args.ConfigNum)
+		return
+	} else if args.ConfigNum > kv.config.Num {
+		// if config is new, reject it
+		reply.Err = ErrWrongConfigNum
+		kv.mu.Unlock()
+		DPrintf("Group%dServer%d configNum is %d, shardState is %v, args.configNum is %d.", kv.gid, kv.me, kv.config.Num, kv.shardDBs[args.ShardIdx].State, args.ConfigNum)
+		return
+	}
+
+	// try to log the shard
+	shard := make(map[string]string)
+	for key, value := range args.Shard {
+		shard[key] = value
+	}
+	index, _, isLeader := kv.rf.Start(Op{
+		Command: opShard,
+		Shard: ShardInfo{
+			Num:   args.ConfigNum,
+			Idx:   args.ShardIdx,
+			Shard: shard,
+		},
+	})
+	// to determine whether it is the leader again
+	if !isLeader {
+		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	// create the notify chan
+	ch := kv.makeNotifyChan(index)
+	kv.mu.Unlock()
+	// wait for notify chan
+	select {
+	case result := <-ch:
+		reply.Err = result.Err
+	case <-time.After(time.Duration(ExecuteTimeout) * time.Second):
+		DPrintf("Group%dServer%d execute Timeout!", kv.gid, kv.me)
+		reply.Err = ErrExecuteTimeout
+	}
+	DPrintf("Group%dServer%d reply is %v.", kv.gid, kv.me, reply)
+	// delete the notify chan
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChans, index)
+		kv.mu.Unlock()
+	}()
+}
+
+func (kv *ShardKV) makeNotifyChan(index int) chan ApplyRes {
+	kv.notifyChans[index] = make(chan ApplyRes)
+	return kv.notifyChans[index]
+}
+
+func (kv *ShardKV) getNotifyChan(index int) chan ApplyRes {
+	if _, ok := kv.notifyChans[index]; ok {
+		return kv.notifyChans[index]
+	} else {
+		return nil
+	}
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -148,7 +343,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 	kv.lastApplied = 0
 	kv.config = shardctrler.Config{}
-	kv.shardDBs = make([]shardDB, shardctrler.NShards)
+	kv.shardDBs = make([]ShardDB, shardctrler.NShards)
+	kv.notifyChans = make(map[int]chan ApplyRes)
+	kv.lastOpRes = make(map[int64]ApplyRes)
 
 	// Use something like this to talk to the shardctrler:
 	kv.scClerk = shardctrler.MakeClerk(kv.ctrlers)
@@ -168,27 +365,175 @@ func (kv *ShardKV) applier() {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
 			kv.mu.Lock()
-			DPrintf("Server%d try to apply Log%d, Log: %v.", kv.rf.GetMe(), msg.CommandIndex, msg.Command.(Op))
+			DPrintf("Group%dServer%d try to apply Log%d, Log: %v.", kv.gid, kv.me, msg.CommandIndex, msg.Command.(Op))
 			// if log already apply, discard it
 			if msg.CommandIndex <= kv.lastApplied {
-				DPrintf("Server%d has already apply the Log%d, discard it.", kv.rf.GetMe(), msg.CommandIndex)
+				DPrintf("Group%dServer%d has already apply the Log%d, discard it.", kv.gid, kv.me, msg.CommandIndex)
 				kv.mu.Unlock()
 				continue
 			}
 
+			// apply log and save the result
+			var applyRes ApplyRes
 			kv.lastApplied = msg.CommandIndex
 			op := msg.Command.(Op)
 			switch op.Command {
 			case opConfig:
 				// if it't config update log, apply it
 				kv.applyConfig(op.Config)
-			default:
+			case opShard:
+				applyRes = kv.receivShard(op.Shard)
+			case opShardClear:
+				kv.clearShard(op.Shard)
+			case opGet:
+				fallthrough
+			case opAppend:
+				fallthrough
+			case opPut:
+				if kv.isDuplicateRequest(op.ClientId, op.SeqId) {
+					DPrintf("Group%dServer%d doesn't apply Log%d, because it's duplicate.", kv.gid, kv.me, msg.CommandIndex)
+					applyRes = kv.lastOpRes[op.ClientId]
+				} else {
+					applyRes = kv.applyLogToDB(op)
+					kv.lastOpRes[op.ClientId] = applyRes
+				}
+			}
 
+			// if server is leader, reply to client
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				if ch := kv.getNotifyChan(msg.CommandIndex); ch != nil {
+					ch <- applyRes
+				}
+			}
+			// if logSize is overLength, snapshot and cut the log
+			if needSnapshot := kv.needSnapshot(); needSnapshot {
+				kv.snapshot(msg.CommandIndex)
 			}
 
 			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			DPrintf("Group%dServer%d try to apply snapshot throught index%d.", kv.gid, kv.me, msg.SnapshotIndex)
+			kv.applySnapshot(msg.Snapshot)
+			kv.lastApplied = msg.SnapshotIndex
+			kv.mu.Unlock()
+		} else {
+			log.Fatalf("Invaild apply log: %v.", msg)
 		}
 	}
+}
+
+func (kv *ShardKV) snapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	if err := e.Encode(&kv.shardDBs); err != nil {
+		DPrintf("Group%dServer%d can not encode the kvShardDBS.", kv.gid, kv.me)
+	}
+
+	if err := e.Encode(&kv.config); err != nil {
+		DPrintf("Group%dServer%d can not encode the kvShardDBS.", kv.gid, kv.me)
+	}
+
+	if err := e.Encode(&kv.lastOpRes); err != nil {
+		DPrintf("Group%dServer%d can not encode the lastOpRes.", kv.gid, kv.me)
+	}
+
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *ShardKV) applySnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&kv.shardDBs); err != nil {
+		DPrintf("Group%dServer%d can not decode the kvShardDBS.", kv.gid, kv.me)
+	}
+
+	if err := d.Decode(&kv.config); err != nil {
+		DPrintf("Group%dServer%d can not decode the config.", kv.gid, kv.me)
+	}
+
+	if err := d.Decode(&kv.lastOpRes); err != nil {
+		DPrintf("Group%dServer%d can not decode the lastOpRes.", kv.gid, kv.me)
+	}
+}
+
+func (kv *ShardKV) needSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	if kv.maxraftstate <= kv.rf.GetRaftStateSize() {
+		return true
+	}
+
+	return false
+}
+
+func (kv *ShardKV) applyLogToDB(op Op) ApplyRes {
+	applyRes := ApplyRes{
+		ClientId: op.ClientId,
+		SeqId:    op.SeqId,
+	}
+
+	switch op.Command {
+	case opGet:
+		applyRes.Value, applyRes.Err = kv.get(op.Key)
+		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, applyRes.Value)
+	case opPut:
+		applyRes.Err = kv.put(op.Key, op.Value)
+		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+	case opAppend:
+		applyRes.Err = kv.append(op.Key, op.Value)
+		DPrintf("Group%dServer%d Apply %v to kvDB, key is %v, value is %v.", kv.gid, kv.me, op.Command, op.Key, op.Value)
+	}
+	return applyRes
+}
+
+func (kv *ShardKV) get(key string) (string, Err) {
+	idx := key2shard(key)
+	if kv.config.Shards[idx] != kv.gid {
+		return "", ErrWrongOwner
+	}
+	if kv.shardDBs[idx].State != Serving {
+		return "", ErrPauseServe
+	}
+
+	if value, ok := kv.shardDBs[idx].DB[key]; ok {
+		return value, OK
+	}
+	return "", ErrNoKey
+}
+
+func (kv *ShardKV) put(key, value string) Err {
+	idx := key2shard(key)
+	if kv.config.Shards[idx] != kv.gid {
+		return ErrWrongOwner
+	}
+	if kv.shardDBs[idx].State != Serving {
+		return ErrPauseServe
+	}
+
+	kv.shardDBs[idx].DB[key] = value
+	return OK
+}
+
+func (kv *ShardKV) append(key, value string) Err {
+	idx := key2shard(key)
+	if kv.config.Shards[idx] != kv.gid {
+		return ErrWrongOwner
+	}
+	if kv.shardDBs[idx].State != Serving {
+		return ErrPauseServe
+	}
+
+	kv.shardDBs[idx].DB[key] += value
+	return OK
 }
 
 func (kv *ShardKV) fetchConfigLoop() {
@@ -202,7 +547,7 @@ func (kv *ShardKV) fetchConfigLoop() {
 			newConfig := kv.scClerk.Query(configNum + 1)
 			// if config is new, update config
 			if newConfig.Num > configNum {
-				DPrintf("Server%d update config%d -> %d, newShard: %v", kv.rf.GetMe(), configNum, newConfig.Num, newConfig.Shards)
+				DPrintf("Group%dServer%d update config%d -> %d, newShard: %v", kv.gid, kv.me, configNum, newConfig.Num, newConfig.Shards)
 				kv.updateConfig(newConfig)
 			}
 		} else {
@@ -216,27 +561,39 @@ func (kv *ShardKV) fetchConfigLoop() {
 func (kv *ShardKV) migrateShardLoop() {
 	for !kv.killed() {
 		kv.mu.Lock()
-		for idx, shardDB := range kv.shardDBs {
-			if shardDB.state == Pushing {
-				// try to send shard to new owner
-				args := SendShardArgs{
-					configNum: kv.config.Num,
-					shard:     make(map[string]string),
-				}
-				for key, value := range shardDB.db {
-					args.shard[key] = value
-				}
+		if kv.isLeader() {
+			for idx, shardDB := range kv.shardDBs {
+				if shardDB.State == Pushing {
+					// try to send shard to new owner
+					args := ShardArgs{
+						ConfigNum: kv.config.Num,
+						ShardIdx:  idx,
+						Shard:     make(map[string]string),
+					}
+					for key, value := range shardDB.DB {
+						args.Shard[key] = value
+					}
 
-				gid := kv.config.Shards[idx]
-				DPrintf("Server%d send shard%d to Group%d in config%d.", kv.rf.GetMe(), idx, gid, kv.config.Num)
-				if servers, ok := kv.config.Groups[gid]; ok {
-					// try each server for the shard.
-					for si := 0; si < len(servers); si = (si + 1) % len(servers) {
-						srv := kv.make_end(servers[si])
-						var reply SendShardReply
-						ok := srv.Call("ShardKV.SendShard", &args, &reply)
-						if ok && reply.Err == OK {
-							break
+					gid := kv.config.Shards[idx]
+					DPrintf("Group%dServer%d send shard%d to Group%d in config%d.", kv.gid, kv.me, idx, gid, kv.config.Num)
+					if servers, ok := kv.config.Groups[gid]; ok {
+						// try each server for the shard.
+						for si := 0; si < len(servers); si = (si + 1) % len(servers) {
+							srv := kv.make_end(servers[si])
+							var reply ShardReply
+							ok := srv.Call("ShardKV.Shard", &args, &reply)
+							if ok && reply.Err == OK {
+								// After send shard to new own, clear the shard
+								kv.rf.Start(Op{
+									Command: opShardClear,
+									Shard: ShardInfo{
+										Num:   args.ConfigNum,
+										Idx:   args.ShardIdx,
+										Shard: nil,
+									},
+								})
+								break
+							}
 						}
 					}
 				}
@@ -245,6 +602,39 @@ func (kv *ShardKV) migrateShardLoop() {
 
 		kv.mu.Unlock()
 		time.Sleep(time.Duration(MigrateInterval) * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) receivShard(shard ShardInfo) ApplyRes {
+	applyRes := ApplyRes{
+		Err: OK,
+	}
+
+	if shard.Num > kv.config.Num {
+		applyRes.Err = ErrWrongConfigNum
+	} else if shard.Num == kv.config.Num {
+		if kv.shardDBs[shard.Idx].State == Pulling {
+			kv.shardDBs[shard.Idx].DB = make(map[string]string)
+			for key, value := range shard.Shard {
+				kv.shardDBs[shard.Idx].DB[key] = value
+			}
+			kv.shardDBs[shard.Idx].State = Serving
+		} else if kv.shardDBs[shard.Idx].State == Pushing {
+			applyRes.Err = ErrWrongOwner
+		}
+	}
+
+	return applyRes
+}
+
+func (kv *ShardKV) clearShard(shard ShardInfo) {
+	if shard.Num != kv.config.Num || kv.shardDBs[shard.Idx].State != Pushing {
+		return
+	}
+
+	kv.shardDBs[shard.Idx] = ShardDB{
+		State: Invalid,
+		DB:    make(map[string]string),
 	}
 }
 
@@ -262,24 +652,32 @@ func (kv *ShardKV) applyConfig(newConfig shardctrler.Config) {
 		kv.config.Groups[gid] = append([]string{}, servers...)
 	}
 	// update shard state
-	for i, gid := range newConfig.Shards {
-		if gid == kv.gid {
-			// wait for receving shard
-			if kv.shardDBs[i].state == Serving {
-				kv.shardDBs[i].state = Pulling
-				kv.shardDBs[i].db = make(map[string]string)
+	if newConfig.Num == InitConfigNum {
+		for i, gid := range newConfig.Shards {
+			if gid == kv.gid {
+				kv.shardDBs[i].State = Serving
+				kv.shardDBs[i].DB = make(map[string]string)
 			}
-		} else {
-			// set pushing, and the send shard to new owner
-			if kv.shardDBs[i].state == Serving {
-				kv.shardDBs[i].state = Pushing
+		}
+	} else {
+		for i, gid := range newConfig.Shards {
+			if gid == kv.gid {
+				// wait for receving shard
+				if kv.shardDBs[i].State == Invalid {
+					kv.shardDBs[i].State = Pulling
+					kv.shardDBs[i].DB = make(map[string]string)
+				}
+			} else {
+				// set pushing, and the send shard to new owner
+				if kv.shardDBs[i].State == Serving {
+					kv.shardDBs[i].State = Pushing
+				}
 			}
 		}
 	}
 }
 
 func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
-	kv.mu.Lock()
 	// log the new config
 	command := Op{
 		Command: opConfig,
@@ -293,13 +691,12 @@ func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
 		command.Config.Groups[gid] = append([]string{}, servers...)
 	}
 	kv.rf.Start(command)
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) isReConfiguring() bool {
 	// if any shard is at pulling state or pushing state, that mean reconfiguration doesn't finish
 	for _, shardDB := range kv.shardDBs {
-		if shardDB.state == Pulling || shardDB.state == Pushing {
+		if shardDB.State == Pulling || shardDB.State == Pushing {
 			return false
 		}
 	}
