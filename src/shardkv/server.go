@@ -401,7 +401,7 @@ func (kv *ShardKV) applier() {
 			op := msg.Command.(Op)
 			switch op.Command {
 			case opConfig:
-				// if it't config update log, apply it
+				// if it's config update log, apply it
 				kv.applyConfig(op.Config)
 			case opShard:
 				applyRes = kv.receivShard(op.Shard)
@@ -446,6 +446,7 @@ func (kv *ShardKV) applier() {
 }
 
 func (kv *ShardKV) snapshot(index int) {
+	DPrintf("Group%dServer%d snapshot!", kv.gid, kv.me)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -469,6 +470,7 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 		return
 	}
 
+	DPrintf("Group%dServer%d read snapshot!", kv.gid, kv.me)
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
@@ -611,7 +613,7 @@ func (kv *ShardKV) migrateShardLoop() {
 					DPrintf("Group%dServer%d send shard%d to Group%d in config%d, shard%v.", kv.gid, kv.me, idx, gid, kv.config.Num, shardDB.DB)
 					if servers, ok := kv.config.Groups[gid]; ok {
 						// try each server for the shard.
-						for si := 0; si < len(servers); si = (si + 1) % len(servers) {
+						for si := 0; si < len(servers); si++ {
 							srv := kv.make_end(servers[si])
 							var reply ShardReply
 							ok := srv.Call("ShardKV.Shard", &args, &reply)
@@ -678,6 +680,10 @@ func (kv *ShardKV) clearShard(shard ShardInfo) {
 }
 
 func (kv *ShardKV) applyConfig(newConfig shardctrler.Config) {
+	// fix the bug that config rollback
+	if newConfig.Num < kv.config.Num {
+		return
+	}
 	// update config
 	kv.config.Num = newConfig.Num
 	kv.config.Shards = newConfig.Shards
