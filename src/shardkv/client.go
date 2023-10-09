@@ -72,16 +72,23 @@ func (ck *Clerk) Get(key string) string {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
-					return reply.Value
-				} else if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
-					break
-				} else if ok && (reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout) { // ... not ok, or ErrWrongLeader
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
-					continue
+				if ok {
+					if reply.Err == OK || reply.Err == ErrNoKey {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply)
+						return reply.Value
+					} else if reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner || reply.Err == ErrPauseServe {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+						break
+					} else if reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout { // ... not ok, or ErrWrongLeader
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+						continue
+					} else {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+					}
+				} else {
+					DPrintf("Client%d can't received reply!", ck.clientId)
 				}
+
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -111,15 +118,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply)
-					return
-				} else if ok && (reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner) {
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
-					break
-				} else if ok && (reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout) { // ... not ok, or ErrWrongLeader
-					DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
-					continue
+				if ok {
+					if reply.Err == OK {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply)
+						return
+					} else if reply.Err == ErrWrongGroup || reply.Err == ErrWrongOwner || reply.Err == ErrPauseServe {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+						break
+					} else if reply.Err == ErrWrongLeader || reply.Err == ErrExecuteTimeout { // ... not ok, or ErrWrongLeader
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+						continue
+					} else {
+						DPrintf("Client%d received reply: %v.", ck.clientId, reply.Err)
+					}
+				} else {
+					DPrintf("Client%d can't received reply!", ck.clientId)
 				}
 			}
 		}

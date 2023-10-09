@@ -37,9 +37,10 @@ type ShardDB struct {
 }
 
 type ShardInfo struct {
-	Num   int
-	Idx   int
-	Shard map[string]string
+	Num        int
+	Idx        int
+	Shard      map[string]string
+	Client2Seq map[int64]int
 }
 
 type Op struct {
@@ -80,7 +81,7 @@ type ShardKV struct {
 	config      shardctrler.Config
 	scClerk     *shardctrler.Clerk
 	notifyChans map[int]chan ApplyRes
-	lastOpRes   map[int64]ApplyRes
+	client2Seq  map[int64]int
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -109,10 +110,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	// if request is duplicate, reply the last result
 	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
-		reply.Err = kv.lastOpRes[args.ClientId].Err
-		reply.Value = kv.lastOpRes[args.ClientId].Value
+		reply.Value, reply.Err = kv.get(args.Key)
 		kv.mu.Unlock()
-		DPrintf("DuplicateRequest! Reply the lastOpRes: reply is %v.", reply)
+		DPrintf("DuplicateRequest! Reply is %v.", reply)
 		return
 	}
 	// try to log the request
@@ -122,6 +122,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		ClientId: args.ClientId,
 		SeqId:    args.SeqId,
 	})
+	DPrintf("Group%dServer%d add Log%d{ClientId:%d, SeqId:%d, opGet, key:%v}", kv.gid, kv.me, index, args.ClientId, args.SeqId, args.Key)
 	// to determine whether it is the leader agin
 	if !isLeader {
 		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
@@ -173,9 +174,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	// if request is duplicate, reply the last result
 	if kv.isDuplicateRequest(args.ClientId, args.SeqId) {
-		reply.Err = kv.lastOpRes[args.ClientId].Err
+		reply.Err = OK
 		kv.mu.Unlock()
-		DPrintf("DuplicateRequest! Reply the lastOpRes: reply is %v.", reply)
+		DPrintf("DuplicateRequest! Rply is %v.", reply)
 		return
 	}
 	// try to log the request
@@ -186,6 +187,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId: args.ClientId,
 		SeqId:    args.SeqId,
 	})
+	DPrintf("Group%dServer%d add Log%d:{ClientId:%d, SeqId:%d, %v, key:%v, value:%v}", kv.gid, kv.me, index, args.ClientId, args.SeqId, args.Op, args.Key, args.Value)
 	// to determine whether it is the leader agin
 	if !isLeader {
 		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
@@ -211,8 +213,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 }
 
 func (kv *ShardKV) isDuplicateRequest(clientId int64, seqId int) bool {
-	if res, ok := kv.lastOpRes[clientId]; ok && (res.Err == OK || res.Err == ErrNoKey) {
-		return seqId == res.SeqId
+	if seq, ok := kv.client2Seq[clientId]; ok {
+		return seqId == seq
 	} else {
 		return false
 	}
@@ -253,14 +255,20 @@ func (kv *ShardKV) Shard(args *ShardArgs, reply *ShardReply) {
 	for key, value := range args.Shard {
 		shard[key] = value
 	}
+	client2Seq := make(map[int64]int)
+	for key, value := range args.Client2Seq {
+		client2Seq[key] = value
+	}
 	index, _, isLeader := kv.rf.Start(Op{
 		Command: opShard,
 		Shard: ShardInfo{
-			Num:   args.ConfigNum,
-			Idx:   args.ShardIdx,
-			Shard: shard,
+			Num:        args.ConfigNum,
+			Idx:        args.ShardIdx,
+			Shard:      shard,
+			Client2Seq: client2Seq,
 		},
 	})
+	DPrintf("Group%dServer%d add Log%d:{Shard, num:%d, idx:%d, shard:%v}", kv.gid, kv.me, index, args.ConfigNum, args.ShardIdx, shard)
 	// to determine whether it is the leader again
 	if !isLeader {
 		DPrintf("Group%dServer%d isn't leader! Reply errWrongLeader.", kv.gid, kv.me)
@@ -359,7 +367,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.config = shardctrler.Config{}
 	kv.shardDBs = make([]ShardDB, shardctrler.NShards)
 	kv.notifyChans = make(map[int]chan ApplyRes)
-	kv.lastOpRes = make(map[int64]ApplyRes)
+	kv.client2Seq = make(map[int64]int)
 
 	// Use something like this to talk to the shardctrler:
 	kv.scClerk = shardctrler.MakeClerk(kv.ctrlers)
@@ -406,10 +414,10 @@ func (kv *ShardKV) applier() {
 			case opPut:
 				if kv.isDuplicateRequest(op.ClientId, op.SeqId) {
 					DPrintf("Group%dServer%d doesn't apply Log%d, because it's duplicate.", kv.gid, kv.me, msg.CommandIndex)
-					applyRes = kv.lastOpRes[op.ClientId]
+					applyRes.Err = OK
 				} else {
 					applyRes = kv.applyLogToDB(op)
-					kv.lastOpRes[op.ClientId] = applyRes
+					kv.client2Seq[op.ClientId] = op.SeqId
 				}
 			}
 
@@ -449,8 +457,8 @@ func (kv *ShardKV) snapshot(index int) {
 		DPrintf("Group%dServer%d can not encode the kvShardDBS.", kv.gid, kv.me)
 	}
 
-	if err := e.Encode(&kv.lastOpRes); err != nil {
-		DPrintf("Group%dServer%d can not encode the lastOpRes.", kv.gid, kv.me)
+	if err := e.Encode(&kv.client2Seq); err != nil {
+		DPrintf("Group%dServer%d can not encode the client2Seq.", kv.gid, kv.me)
 	}
 
 	kv.rf.Snapshot(index, w.Bytes())
@@ -468,12 +476,13 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) {
 		DPrintf("Group%dServer%d can not decode the kvShardDBS.", kv.gid, kv.me)
 	}
 
+	kv.config = shardctrler.Config{}
 	if err := d.Decode(&kv.config); err != nil {
 		DPrintf("Group%dServer%d can not decode the config.", kv.gid, kv.me)
 	}
 
-	if err := d.Decode(&kv.lastOpRes); err != nil {
-		DPrintf("Group%dServer%d can not decode the lastOpRes.", kv.gid, kv.me)
+	if err := d.Decode(&kv.client2Seq); err != nil {
+		DPrintf("Group%dServer%d can not decode the client2Seq.", kv.gid, kv.me)
 	}
 }
 
@@ -517,12 +526,12 @@ func (kv *ShardKV) applyLogToDB(op Op) ApplyRes {
 
 func (kv *ShardKV) get(key string) (string, Err) {
 	idx := key2shard(key)
-	if kv.config.Shards[idx] != kv.gid {
-		return "", ErrWrongOwner
-	}
-	if kv.shardDBs[idx].State != Serving {
-		return "", ErrPauseServe
-	}
+	// if kv.config.Shards[idx] != kv.gid {
+	// 	return "", ErrWrongOwner
+	// }
+	// if kv.shardDBs[idx].State != Serving {
+	// 	return "", ErrPauseServe
+	// }
 
 	if value, ok := kv.shardDBs[idx].DB[key]; ok {
 		return value, OK
@@ -532,12 +541,12 @@ func (kv *ShardKV) get(key string) (string, Err) {
 
 func (kv *ShardKV) put(key, value string) Err {
 	idx := key2shard(key)
-	if kv.config.Shards[idx] != kv.gid {
-		return ErrWrongOwner
-	}
-	if kv.shardDBs[idx].State != Serving {
-		return ErrPauseServe
-	}
+	// if kv.config.Shards[idx] != kv.gid {
+	// 	return ErrWrongOwner
+	// }
+	// if kv.shardDBs[idx].State != Serving {
+	// 	return ErrPauseServe
+	// }
 
 	kv.shardDBs[idx].DB[key] = value
 	return OK
@@ -545,12 +554,12 @@ func (kv *ShardKV) put(key, value string) Err {
 
 func (kv *ShardKV) append(key, value string) Err {
 	idx := key2shard(key)
-	if kv.config.Shards[idx] != kv.gid {
-		return ErrWrongOwner
-	}
-	if kv.shardDBs[idx].State != Serving {
-		return ErrPauseServe
-	}
+	// if kv.config.Shards[idx] != kv.gid {
+	// 	return ErrWrongOwner
+	// }
+	// if kv.shardDBs[idx].State != Serving {
+	// 	return ErrPauseServe
+	// }
 
 	kv.shardDBs[idx].DB[key] += value
 	return OK
@@ -586,16 +595,20 @@ func (kv *ShardKV) migrateShardLoop() {
 				if shardDB.State == Pushing {
 					// try to send shard to new owner
 					args := ShardArgs{
-						ConfigNum: kv.config.Num,
-						ShardIdx:  idx,
-						Shard:     make(map[string]string),
+						ConfigNum:  kv.config.Num,
+						ShardIdx:   idx,
+						Shard:      make(map[string]string),
+						Client2Seq: make(map[int64]int),
 					}
 					for key, value := range shardDB.DB {
 						args.Shard[key] = value
 					}
+					for key, value := range kv.client2Seq {
+						args.Client2Seq[key] = value
+					}
 
 					gid := kv.config.Shards[idx]
-					DPrintf("Group%dServer%d send shard%d to Group%d in config%d.", kv.gid, kv.me, idx, gid, kv.config.Num)
+					DPrintf("Group%dServer%d send shard%d to Group%d in config%d, shard%v.", kv.gid, kv.me, idx, gid, kv.config.Num, shardDB.DB)
 					if servers, ok := kv.config.Groups[gid]; ok {
 						// try each server for the shard.
 						for si := 0; si < len(servers); si = (si + 1) % len(servers) {
@@ -604,7 +617,7 @@ func (kv *ShardKV) migrateShardLoop() {
 							ok := srv.Call("ShardKV.Shard", &args, &reply)
 							if ok && reply.Err == OK {
 								// After send shard to new own, clear the shard
-								kv.rf.Start(Op{
+								index, _, _ := kv.rf.Start(Op{
 									Command: opShardClear,
 									Shard: ShardInfo{
 										Num:   args.ConfigNum,
@@ -612,6 +625,7 @@ func (kv *ShardKV) migrateShardLoop() {
 										Shard: nil,
 									},
 								})
+								DPrintf("Group%dServer%d add Log%d:{ShardClear, num:%d, idx:%d}", kv.gid, kv.me, index, args.ConfigNum, args.ShardIdx)
 								break
 							}
 						}
@@ -637,6 +651,11 @@ func (kv *ShardKV) receivShard(shard ShardInfo) ApplyRes {
 			kv.shardDBs[shard.Idx].DB = make(map[string]string)
 			for key, value := range shard.Shard {
 				kv.shardDBs[shard.Idx].DB[key] = value
+			}
+			for key, value := range shard.Client2Seq {
+				if oldValue, ok := kv.client2Seq[key]; !ok || oldValue < value {
+					kv.client2Seq[key] = value
+				}
 			}
 			kv.shardDBs[shard.Idx].State = Serving
 		} else if kv.shardDBs[shard.Idx].State == Pushing {
@@ -706,13 +725,14 @@ func (kv *ShardKV) updateConfig(newConfig shardctrler.Config) {
 	for gid, servers := range newConfig.Groups {
 		command.Config.Groups[gid] = append([]string{}, servers...)
 	}
-	kv.rf.Start(command)
+	index, _, _ := kv.rf.Start(command)
+	DPrintf("Group%dServer%d add Log%d:{Config, num:%d, shards:%v, group:%v}", kv.gid, kv.me, index, newConfig.Num, newConfig.Shards, newConfig.Groups)
 }
 
 func (kv *ShardKV) isReConfiguring() bool {
 	// if any shard is at pulling state or pushing state, that mean reconfiguration doesn't finish
 	for _, shardDB := range kv.shardDBs {
-		if shardDB.State == Pulling {
+		if shardDB.State == Pulling || shardDB.State == Pushing {
 			return true
 		}
 	}

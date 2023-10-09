@@ -67,9 +67,10 @@ type GetReply struct {
 }
 
 type ShardArgs struct {
-	ConfigNum int
-	ShardIdx  int
-	Shard     map[string]string
+	ConfigNum  int
+	ShardIdx   int
+	Shard      map[string]string
+	Client2Seq map[int64]int
 }
 
 type ShardReply struct {
